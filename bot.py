@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -38,12 +39,16 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SELLER_ID = int(os.getenv("TELEGRAM_SELLER_ID", "0"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "store.sqlite3")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 CATALOG_PATH = os.getenv("CATALOG_PATH", "catalog.json")
 CURRENCY = os.getenv("CURRENCY", "ARS")
 SHOP_NAME = os.getenv("SHOP_NAME", "Tienda").strip() or "Tienda"
 ORDER_RESERVATION_HOURS = int(os.getenv("ORDER_RESERVATION_HOURS", "24"))
 PERSISTENCE_PATH = os.getenv("PERSISTENCE_PATH", "bot_state.pickle")
-STORE = Store(DATABASE_PATH, CATALOG_PATH)
+WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "false").strip().lower() == "true"
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+WEBHOOK_PATH = "telegram"
+STORE = Store(DATABASE_URL or DATABASE_PATH, CATALOG_PATH)
 RESERVATION_TASK: asyncio.Task | None = None
 
 STATUS_LABELS = {
@@ -1931,6 +1936,28 @@ def build_application() -> Application:
 
 def main() -> None:
     application = build_application()
+    if WEBHOOK_MODE:
+        hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+        if not hostname:
+            raise RuntimeError(
+                "RENDER_EXTERNAL_HOSTNAME is required when WEBHOOK_MODE is enabled."
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
+            raise RuntimeError(
+                "TELEGRAM_WEBHOOK_SECRET must contain 1-256 letters, digits, "
+                "underscores, or hyphens."
+            )
+        port = int(os.getenv("PORT", "10000"))
+        logger.info("Starting Telegram storefront webhook on port %s", port)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=WEBHOOK_PATH,
+            webhook_url=f"https://{hostname}/{WEBHOOK_PATH}",
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        return
     logger.info("Starting Telegram storefront polling")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

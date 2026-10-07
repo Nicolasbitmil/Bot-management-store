@@ -187,8 +187,7 @@ El repositorio incluye una primera versión ejecutable del bot:
 
 - `/start`, `/ayuda`, `/catalogo`, `/buscar`, `/carrito`, `/pedido` y
   `/mis_pedidos`.
-- Menú persistente con botones para catálogo, carrito, pedidos, ayuda y
-  reiniciar la selección.
+- Menú persistente con botones para catálogo, carrito, pedidos y ayuda.
 - Catálogo con productos, variantes, talles, colores, precios, stock y foto
   opcional, navegación por categoría y búsqueda en nombre, categoría y
   descripción.
@@ -211,8 +210,8 @@ El repositorio incluye una primera versión ejecutable del bot:
   pueden retirarse del catálogo sin borrar pedidos anteriores.
 - Botones inline para seleccionar variantes, volver al catálogo, editar el
   carrito, continuar comprando y cancelar la compra.
-- Carrito persistente en SQLite con controles para aumentar, disminuir o quitar
-  unidades.
+- Carrito persistente en SQLite local o PostgreSQL externo, con controles para
+  aumentar, disminuir o quitar unidades.
 - Checkout que solicita contacto y entrega, muestra el resumen y pide una
   confirmación antes de enviar el pedido.
 - Comando `/reiniciar` para vaciar el carrito y cancelar el flujo de compra
@@ -225,9 +224,10 @@ El repositorio incluye una primera versión ejecutable del bot:
 - Reserva de stock al crear el pedido; al confirmar se descuenta del stock y al
   rechazar o cancelar se libera la reserva. Los pedidos pendientes vencen
   automáticamente después del plazo configurado y liberan el stock.
-- Persistencia de pedidos y estados en SQLite. Los pedidos guardan una copia de
-  los datos del producto y del precio al momento de la compra. El cliente puede
-  abrir un pedido para consultar sus artículos y el historial de cambios.
+- Persistencia de pedidos y estados en SQLite local o PostgreSQL externo. Los
+  pedidos guardan una copia de los datos del producto y del precio al momento
+  de la compra. El cliente puede abrir un pedido para consultar sus artículos
+  y el historial de cambios.
 
 ### Requisitos
 
@@ -255,27 +255,46 @@ No compartir ni subir el archivo `.env`. Luego iniciar el bot:
 python bot.py
 ```
 
-### Despliegue en Render
+### Despliegue gratuito en Render con webhook
 
-El archivo `render.yaml` configura el bot como un **Background Worker** con
-polling y un disco persistente para SQLite y el estado de Telegram. Para
-desplegarlo:
+`render.yaml` configura un **Web Service** gratuito. En Render, el bot recibe
+las actualizaciones por webhook en `/telegram`; la variable automática
+`RENDER_EXTERNAL_HOSTNAME` se usa para registrar la URL HTTPS. Localmente sigue
+usando polling si `WEBHOOK_MODE=false`.
 
-1. Subir el repositorio a GitHub y, en Render, elegir **New +** → **Blueprint**.
-2. Conectar el repositorio y confirmar la creación del servicio definido en
-   `render.yaml`.
-3. En la configuración inicial, completar `TELEGRAM_BOT_TOKEN` (token de
-   BotFather) y `TELEGRAM_SELLER_ID` (ID numérico del vendedor).
-4. Antes del primer despliegue, reemplazar `catalog.json` por el catálogo real.
-   El catálogo se importa a SQLite cuando la base de datos está vacía; después,
-   los productos se administran desde Telegram con `/admin`.
-5. Revisar `SHOP_NAME` y `CURRENCY` en las variables de entorno del servicio.
+Render Free duerme el servicio tras 15 minutos sin tráfico y elimina los
+archivos locales al dormir o redeplegar. Por eso la tienda usa PostgreSQL
+externo y no SQLite en Render. Esta guía usa el plan gratuito de [Neon](https://neon.com/):
 
-El servicio necesita un plan pago de worker para adjuntar el disco persistente.
-No quites el disco ni cambies las rutas `DATABASE_PATH` y `PERSISTENCE_PATH`:
-SQLite y el estado de conversación se perderían entre reinicios. Mantené una
-sola instancia del worker, ya que el bot usa polling y el disco no debe
-compartirse entre instancias.
+1. Antes del primer despliegue, revisar `catalog.json` para que no se publiquen
+   los productos de ejemplo. Crear un proyecto PostgreSQL en Neon y copiar su
+   cadena de conexión **pooled**. No la publiques ni la guardes en el repositorio.
+2. Subir los cambios a GitHub. En Render, elegir **New + → Blueprint**, conectar
+   el repositorio y la rama `main`, y confirmar la configuración de `render.yaml`.
+   También se puede crear un **Web Service** manualmente con Build Command
+   `pip install -r requirements.txt` y Start Command `python bot.py`.
+3. En las variables de entorno de Render, completar:
+   - `TELEGRAM_BOT_TOKEN`: token de BotFather.
+   - `TELEGRAM_SELLER_ID`: ID numérico del vendedor.
+   - `DATABASE_URL`: cadena pooled de Neon.
+   - `TELEGRAM_WEBHOOK_SECRET`: crear un secreto válido en PowerShell con
+     `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+   - `WEBHOOK_MODE`: `true`.
+   - `SHOP_NAME`, `CURRENCY` y `ORDER_RESERVATION_HOURS` según la tienda.
+4. No configures `RENDER_EXTERNAL_HOSTNAME` ni `PORT`: Render las proporciona.
+   Guardar los cambios y esperar a que el deploy termine correctamente.
+5. En Telegram, iniciar el bot con `/start`. El sitio no muestra una página de
+   tienda: su servidor HTTP recibe los webhooks de Telegram.
+
+Al iniciar, una base PostgreSQL vacía carga los productos de `catalog.json`;
+después, se administra el catálogo desde Telegram con `/admin`. **Los datos que
+ya existan en el SQLite local no se migran automáticamente**: cargar el
+catálogo inicial en PostgreSQL no copia pedidos o cambios locales. El archivo
+Pickle de Telegram vive en el disco efímero de Render, de modo que los pasos de
+conversación incompletos pueden reiniciarse cuando el servicio duerme; el
+carrito, inventario, categorías y pedidos quedan en PostgreSQL. El plan gratuito
+de Neon puede suspender la base por inactividad, por lo que la primera
+actualización después de dormir podría tardar.
 
 El administrador autorizado debe abrir el bot en Telegram y enviar `/admin`.
 Desde el panel, primero puede crear las categorías en **Categorías**. Luego
@@ -297,12 +316,14 @@ La primera ejecución crea `store.sqlite3` y carga el catálogo inicial desde
 `catalog.json`. El precio se expresa en centavos/unidades menores; por ejemplo,
 `450000` se muestra como `ARS 4.500,00`. Los productos de ejemplo deben
 reemplazarse por los de la tienda **antes de la primera ejecución**. Una vez
-creada la base de datos, el catálogo vive en SQLite; modificar el JSON no
-actualiza automáticamente una base ya existente. `DATABASE_PATH`,
-`CATALOG_PATH`, `CURRENCY` y `PERSISTENCE_PATH` también pueden configurarse en
-`.env`. `ORDER_RESERVATION_HOURS` define cuánto tiempo se mantiene una reserva
-pendiente antes de liberarla automáticamente; el valor predeterminado es 24
-horas. El bot revisa las reservas vencidas al iniciar y luego cada minuto.
+creada la base de datos, el catálogo vive en la base configurada; modificar el
+JSON no actualiza automáticamente una base ya existente. Localmente el bot usa
+SQLite por defecto (`DATABASE_PATH`); si se define `DATABASE_URL`, usa
+PostgreSQL. `CATALOG_PATH`, `CURRENCY` y `PERSISTENCE_PATH` también pueden
+configurarse en `.env`. `ORDER_RESERVATION_HOURS` define cuánto tiempo se
+mantiene una reserva pendiente antes de liberarla automáticamente; el valor
+predeterminado es 24 horas. El bot revisa las reservas vencidas al iniciar y
+luego cada minuto.
 
 ### Pruebas
 
