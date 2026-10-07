@@ -264,6 +264,11 @@ class StoreTests(unittest.TestCase):
         self.store.resolve_order(order_id, "rejected", 9001)
         self.store.add_to_cart(1002, self.variant_id, 2)
 
+    def test_adding_same_variant_increments_cart_quantity(self) -> None:
+        self.store.add_to_cart(1001, self.variant_id)
+        self.store.add_to_cart(1001, self.variant_id)
+        self.assertEqual(self.store.cart_items(1001)[0]["quantity"], 2)
+
     def test_customer_can_clear_cart_without_deleting_orders(self) -> None:
         self.store.add_to_cart(1001, self.variant_id)
         order_id = self.store.create_order(1001, "Cliente", "12345", "Retiro", "ARS")

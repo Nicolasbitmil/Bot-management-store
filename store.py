@@ -707,7 +707,7 @@ class Store:
                 """INSERT INTO cart_items(telegram_id, variant_id, quantity)
                    VALUES (?, ?, ?)
                    ON CONFLICT(telegram_id, variant_id)
-                   DO UPDATE SET quantity = quantity + excluded.quantity""",
+                   DO UPDATE SET quantity = cart_items.quantity + excluded.quantity""",
                 (telegram_id, variant_id, quantity),
             )
 
