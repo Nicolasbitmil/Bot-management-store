@@ -247,8 +247,10 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Editar `.env` y establecer `TELEGRAM_BOT_TOKEN`, `TELEGRAM_SELLER_ID` y
-`SHOP_NAME` con el nombre visible de la marca.
+Editar `.env` y establecer `TELEGRAM_BOT_TOKEN`, `TELEGRAM_SELLER_IDS` y
+`SHOP_NAME` con el nombre visible de la marca. `TELEGRAM_SELLER_IDS` acepta uno
+o varios IDs numéricos separados por comas, por ejemplo
+`123456789,987654321`.
 No compartir ni subir el archivo `.env`. Luego iniciar el bot:
 
 ```powershell
@@ -275,7 +277,8 @@ externo y no SQLite en Render. Esta guía usa el plan gratuito de [Neon](https:/
    `pip install -r requirements.txt` y Start Command `python bot.py`.
 3. En las variables de entorno de Render, completar:
    - `TELEGRAM_BOT_TOKEN`: token de BotFather.
-   - `TELEGRAM_SELLER_ID`: ID numérico del vendedor.
+   - `TELEGRAM_SELLER_IDS`: IDs numéricos de los vendedores, separados por
+     comas (por ejemplo `123456789,987654321`).
    - `DATABASE_URL`: cadena pooled de Neon.
    - `TELEGRAM_WEBHOOK_SECRET`: crear un secreto válido en PowerShell con
      `python -c "import secrets; print(secrets.token_urlsafe(32))"`.

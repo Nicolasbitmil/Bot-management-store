@@ -37,7 +37,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-SELLER_ID = int(os.getenv("TELEGRAM_SELLER_ID", "0"))
+SELLER_IDS_VALUE = os.getenv("TELEGRAM_SELLER_IDS", "").strip()
+if not SELLER_IDS_VALUE:
+    SELLER_IDS_VALUE = os.getenv("TELEGRAM_SELLER_ID", "").strip()
+SELLER_IDS_LIST: list[int] = []
+for seller_id_value in SELLER_IDS_VALUE.split(","):
+    if not seller_id_value.strip():
+        continue
+    try:
+        seller_id = int(seller_id_value.strip())
+    except ValueError as error:
+        raise RuntimeError(
+            "TELEGRAM_SELLER_IDS must be a comma-separated list of numeric Telegram IDs."
+        ) from error
+    if seller_id <= 0:
+        raise RuntimeError("Telegram seller IDs must be positive integers.")
+    if seller_id not in SELLER_IDS_LIST:
+        SELLER_IDS_LIST.append(seller_id)
+SELLER_IDS = tuple(SELLER_IDS_LIST)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "store.sqlite3")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 CATALOG_PATH = os.getenv("CATALOG_PATH", "catalog.json")
@@ -183,7 +200,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def is_admin(update: Update) -> bool:
-    return update.effective_user is not None and update.effective_user.id == SELLER_ID
+    return (
+        update.effective_user is not None
+        and update.effective_user.id in SELLER_IDS
+    )
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -1467,12 +1487,20 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard = order_actions_keyboard(order)
     if keyboard is None:
         raise RuntimeError(f"Pending order {order_id} has no available seller actions.")
-    try:
-        await context.bot.send_message(
-            chat_id=SELLER_ID, text=seller_message, reply_markup=keyboard
-        )
-    except TelegramError:
-        logger.exception("Order %s created but seller notification failed", order_id)
+    failed_seller_ids = []
+    for seller_id in SELLER_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=seller_id, text=seller_message, reply_markup=keyboard
+            )
+        except TelegramError:
+            failed_seller_ids.append(seller_id)
+            logger.exception(
+                "Order %s created but notification failed for seller %s",
+                order_id,
+                seller_id,
+            )
+    if failed_seller_ids:
         await query.message.reply_text(
             "El pedido quedó guardado, pero no se pudo notificar al vendedor. "
             "Por favor, contactá a la tienda e indicá el número de pedido."
@@ -1903,8 +1931,10 @@ async def stop_reservation_expiry(application: Application) -> None:
 def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN in the environment or .env file.")
-    if SELLER_ID <= 0:
-        raise RuntimeError("Set TELEGRAM_SELLER_ID to the seller's Telegram user ID.")
+    if not SELLER_IDS:
+        raise RuntimeError(
+            "Set TELEGRAM_SELLER_IDS to one or more comma-separated Telegram user IDs."
+        )
     if ORDER_RESERVATION_HOURS < 1:
         raise RuntimeError("ORDER_RESERVATION_HOURS must be at least 1.")
     from telegram.ext import PicklePersistence
