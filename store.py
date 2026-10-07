@@ -1,0 +1,893 @@
+"""SQLite persistence and inventory operations for the Telegram shop."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+class StoreError(Exception):
+    """An expected shop or inventory rule violation."""
+
+
+class Store:
+    def __init__(self, database_path: str, catalog_path: str) -> None:
+        self.database_path = database_path
+        self.catalog_path = catalog_path
+        self._initialize()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._connect() as db:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS products (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '',
+                    photo_url TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS variants (
+                    id INTEGER PRIMARY KEY,
+                    product_id INTEGER NOT NULL REFERENCES products(id),
+                    sku TEXT NOT NULL UNIQUE,
+                    size TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    price_minor INTEGER NOT NULL CHECK(price_minor >= 0),
+                    stock INTEGER NOT NULL CHECK(stock >= 0),
+                    reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved >= 0)
+                );
+                CREATE TABLE IF NOT EXISTS cart_items (
+                    telegram_id INTEGER NOT NULL,
+                    variant_id INTEGER NOT NULL REFERENCES variants(id),
+                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    PRIMARY KEY (telegram_id, variant_id)
+                );
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    customer_name TEXT NOT NULL,
+                    contact TEXT NOT NULL,
+                    delivery TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    total_minor INTEGER NOT NULL CHECK(total_minor >= 0),
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS order_items (
+                    id INTEGER PRIMARY KEY,
+                    order_id INTEGER NOT NULL REFERENCES orders(id),
+                    variant_id INTEGER NOT NULL REFERENCES variants(id),
+                    product_name TEXT NOT NULL,
+                    sku TEXT NOT NULL,
+                    size TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    unit_price_minor INTEGER NOT NULL,
+                    subtotal_minor INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS order_events (
+                    id INTEGER PRIMARY KEY,
+                    order_id INTEGER NOT NULL REFERENCES orders(id),
+                    previous_status TEXT,
+                    new_status TEXT NOT NULL,
+                    actor_telegram_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            order_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(orders)")
+            }
+            if "expires_at" not in order_columns:
+                db.execute("ALTER TABLE orders ADD COLUMN expires_at TEXT")
+            if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
+                self._seed_catalog(db)
+            db.execute(
+                """INSERT OR IGNORE INTO categories(name)
+                   SELECT DISTINCT trim(category) FROM products
+                   WHERE trim(category) != ''"""
+            )
+
+    def _seed_catalog(self, db: sqlite3.Connection) -> None:
+        path = Path(self.catalog_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Catalog file not found: {path}")
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+        products = catalog.get("products")
+        if not isinstance(products, list):
+            raise ValueError("catalog.json must contain a products list")
+
+        for product in products:
+            product_id = db.execute(
+                """INSERT INTO products(name, description, category, photo_url)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    _required_text(product, "name"),
+                    str(product.get("description", "")),
+                    str(product.get("category", "")),
+                    str(product.get("photo_url", "")),
+                ),
+            ).lastrowid
+            variants = product.get("variants")
+            if not isinstance(variants, list) or not variants:
+                raise ValueError(f"Product {product['name']!r} must have variants")
+            for variant in variants:
+                price = variant.get("price_minor")
+                stock = variant.get("stock")
+                if not isinstance(price, int) or price < 0:
+                    raise ValueError("Variant price_minor must be a non-negative integer")
+                if not isinstance(stock, int) or stock < 0:
+                    raise ValueError("Variant stock must be a non-negative integer")
+                db.execute(
+                    """INSERT INTO variants
+                       (product_id, sku, size, color, price_minor, stock)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        product_id,
+                        _required_text(variant, "sku"),
+                        _required_text(variant, "size"),
+                        _required_text(variant, "color"),
+                        price,
+                        stock,
+                    ),
+                )
+
+    def list_products(self, category: str | None = None) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            if category is not None:
+                return db.execute(
+                    """SELECT * FROM products
+                       WHERE active = 1 AND category = ?
+                       ORDER BY name""",
+                    (category,),
+                ).fetchall()
+            return db.execute(
+                "SELECT * FROM products WHERE active = 1 ORDER BY category, name"
+            ).fetchall()
+
+    def product_categories(self) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT DISTINCT category FROM products
+                   WHERE active = 1 AND trim(category) != ''
+                   ORDER BY category COLLATE NOCASE"""
+            ).fetchall()
+            return [str(row["category"]) for row in rows]
+
+    def categories(self, populated_only: bool = False) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            query = """SELECT c.id, c.name,
+                              SUM(CASE WHEN p.active = 1 THEN 1 ELSE 0 END)
+                                  AS product_count,
+                              COUNT(p.id) AS associated_product_count
+                       FROM categories c
+                       LEFT JOIN products p
+                         ON trim(p.category) = c.name COLLATE NOCASE"""
+            if populated_only:
+                query += (
+                    " GROUP BY c.id "
+                    "HAVING SUM(CASE WHEN p.active = 1 THEN 1 ELSE 0 END) > 0"
+                )
+            else:
+                query += " GROUP BY c.id"
+            query += " ORDER BY c.name COLLATE NOCASE"
+            return db.execute(query).fetchall()
+
+    def get_category(self, category_id: int) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT id, name FROM categories WHERE id = ?", (category_id,)
+            ).fetchone()
+
+    def create_category(self, name: str) -> int:
+        category_name = _required_value(name, "categoría")
+        with self._connect() as db:
+            try:
+                cursor = db.execute(
+                    "INSERT INTO categories(name) VALUES (?)", (category_name,)
+                )
+            except sqlite3.IntegrityError as error:
+                raise StoreError("Ya existe una categoría con ese nombre.") from error
+            if cursor.lastrowid is None:
+                raise StoreError("No se pudo crear la categoría.")
+            return int(cursor.lastrowid)
+
+    def rename_category(self, category_id: int, name: str) -> None:
+        category_name = _required_value(name, "categoría")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            category = db.execute(
+                "SELECT name FROM categories WHERE id = ?", (category_id,)
+            ).fetchone()
+            if category is None:
+                raise StoreError("No se encontró esa categoría.")
+            duplicate = db.execute(
+                "SELECT 1 FROM categories WHERE name = ? AND id != ?",
+                (category_name, category_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise StoreError("Ya existe una categoría con ese nombre.")
+            old_name = str(category["name"])
+            db.execute(
+                "UPDATE products SET category = ? WHERE category = ? COLLATE NOCASE",
+                (category_name, old_name),
+            )
+            db.execute(
+                "UPDATE categories SET name = ? WHERE id = ?",
+                (category_name, category_id),
+            )
+
+    def delete_category(
+        self, category_id: int, delete_products: bool = False
+    ) -> int:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            category = db.execute(
+                "SELECT name FROM categories WHERE id = ?", (category_id,)
+            ).fetchone()
+            if category is None:
+                raise StoreError("No se encontró esa categoría.")
+            category_name = str(category["name"])
+            product_rows = db.execute(
+                """SELECT id, active FROM products
+                   WHERE category = ? COLLATE NOCASE""",
+                (category_name,),
+            ).fetchall()
+            product_ids = [int(product["id"]) for product in product_rows]
+            if delete_products and product_ids:
+                for product_id in product_ids:
+                    self._remove_product(db, product_id)
+                placeholders = ",".join("?" for _ in product_ids)
+                db.execute(
+                    f"UPDATE products SET category = '' WHERE id IN ({placeholders})",
+                    product_ids,
+                )
+            else:
+                db.execute(
+                    "UPDATE products SET category = '' WHERE category = ? COLLATE NOCASE",
+                    (category_name,),
+                )
+            db.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+            return len(product_ids)
+
+    def remove_product(self, product_id: int) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            product = db.execute(
+                "SELECT 1 FROM products WHERE id = ?", (product_id,)
+            ).fetchone()
+            if product is None:
+                raise StoreError("No se encontró ese producto.")
+            return self._remove_product(db, product_id)
+
+    @staticmethod
+    def _remove_product(db: sqlite3.Connection, product_id: int) -> bool:
+        db.execute(
+            """DELETE FROM cart_items
+               WHERE variant_id IN (
+                   SELECT id FROM variants WHERE product_id = ?
+               )""",
+            (product_id,),
+        )
+        has_order_history = db.execute(
+            """SELECT 1 FROM order_items oi
+               JOIN variants v ON v.id = oi.variant_id
+               WHERE v.product_id = ? LIMIT 1""",
+            (product_id,),
+        ).fetchone()
+        if has_order_history is not None:
+            db.execute(
+                "UPDATE products SET active = 0 WHERE id = ?", (product_id,)
+            )
+            return True
+        db.execute("DELETE FROM variants WHERE product_id = ?", (product_id,))
+        db.execute("DELETE FROM products WHERE id = ?", (product_id,))
+        return False
+
+    def assign_product_category(
+        self, product_id: int, category_id: int | None
+    ) -> None:
+        with self._connect() as db:
+            if category_id is None:
+                category_name = ""
+            else:
+                category = db.execute(
+                    "SELECT name FROM categories WHERE id = ?", (category_id,)
+                ).fetchone()
+                if category is None:
+                    raise StoreError("No se encontró esa categoría.")
+                category_name = str(category["name"])
+            result = db.execute(
+                "UPDATE products SET category = ? WHERE id = ?",
+                (category_name, product_id),
+            )
+            if result.rowcount != 1:
+                raise StoreError("No se encontró ese producto.")
+
+    def products_in_category(self, category_id: int) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            if category_id == 0:
+                return db.execute(
+                    """SELECT * FROM products
+                       WHERE active = 1 AND trim(category) = ''
+                       ORDER BY name"""
+                ).fetchall()
+            category = db.execute(
+                "SELECT name FROM categories WHERE id = ?", (category_id,)
+            ).fetchone()
+            if category is None:
+                return []
+            return db.execute(
+                """SELECT * FROM products
+                   WHERE active = 1 AND category = ?
+                   ORDER BY name""",
+                (category["name"],),
+            ).fetchall()
+
+    def unassigned_product_count(self) -> int:
+        with self._connect() as db:
+            return int(
+                db.execute(
+                    """SELECT COUNT(*) FROM products
+                       WHERE active = 1 AND trim(category) = ''"""
+                ).fetchone()[0]
+            )
+
+    def search_products(self, query: str) -> list[sqlite3.Row]:
+        search_term = query.strip()
+        if not search_term:
+            return []
+        escaped = search_term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        with self._connect() as db:
+            return db.execute(
+                """SELECT * FROM products
+                   WHERE active = 1
+                     AND (name LIKE ? ESCAPE '\\'
+                          OR description LIKE ? ESCAPE '\\'
+                          OR category LIKE ? ESCAPE '\\')
+                   ORDER BY category, name""",
+                (pattern, pattern, pattern),
+            ).fetchall()
+
+    def admin_products(self) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM products ORDER BY active DESC, category, name"
+            ).fetchall()
+
+    def get_product(self, product_id: int) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM products WHERE id = ? AND active = 1", (product_id,)
+            ).fetchone()
+
+    def admin_get_product(self, product_id: int) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM products WHERE id = ?", (product_id,)
+            ).fetchone()
+
+    def list_variants(self, product_id: int) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT *, stock - reserved AS available FROM variants
+                   WHERE product_id = ? ORDER BY size, color""",
+                (product_id,),
+            ).fetchall()
+
+    def admin_variant(self, variant_id: int) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT v.*, v.stock - v.reserved AS available
+                   FROM variants v WHERE v.id = ?""",
+                (variant_id,),
+            ).fetchone()
+
+    def create_product(
+        self,
+        name: str,
+        description: str,
+        category: str,
+        photo_url: str,
+        variants: list[dict[str, Any]],
+    ) -> int:
+        name = _required_value(name, "nombre")
+        if not variants:
+            raise StoreError("Agregá al menos una variante.")
+        combinations = [
+            (
+                _required_value(variant.get("size"), "talle").casefold(),
+                _required_value(variant.get("color"), "color").casefold(),
+            )
+            for variant in variants
+        ]
+        if len(combinations) != len(set(combinations)):
+            raise StoreError("No repitas la misma combinación de talle y color.")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            category = category.strip()
+            if category:
+                db.execute(
+                    "INSERT OR IGNORE INTO categories(name) VALUES (?)", (category,)
+                )
+                saved_category = db.execute(
+                    "SELECT name FROM categories WHERE name = ?", (category,)
+                ).fetchone()
+                if saved_category is not None:
+                    category = str(saved_category["name"])
+            cursor = db.execute(
+                """INSERT INTO products(name, description, category, photo_url)
+                   VALUES (?, ?, ?, ?)""",
+                (name, description.strip(), category.strip(), photo_url.strip()),
+            )
+            product_id = cursor.lastrowid
+            if product_id is None:
+                raise StoreError("No se pudo crear el producto.")
+            for index, variant in enumerate(variants, start=1):
+                size = _required_value(variant.get("size"), "talle")
+                color = _required_value(variant.get("color"), "color")
+                price = variant.get("price_minor")
+                stock = variant.get("stock")
+                if not isinstance(price, int) or price < 0:
+                    raise StoreError("El precio debe ser un importe válido.")
+                if not isinstance(stock, int) or stock < 0:
+                    raise StoreError("El stock debe ser un número entero igual o mayor a cero.")
+                sku = f"PRD-{product_id:06d}-{index:03d}"
+                db.execute(
+                    """INSERT INTO variants
+                       (product_id, sku, size, color, price_minor, stock)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (product_id, sku, size, color, price, stock),
+                )
+            return int(product_id)
+
+    def update_product_field(self, product_id: int, field: str, value: str) -> None:
+        columns = {"name", "description", "category", "photo_url"}
+        if field not in columns:
+            raise ValueError(f"Unsupported product field: {field}")
+        if field == "name":
+            value = _required_value(value, "nombre")
+        with self._connect() as db:
+            value = value.strip()
+            if field == "category" and value:
+                db.execute(
+                    "INSERT OR IGNORE INTO categories(name) VALUES (?)", (value,)
+                )
+                saved_category = db.execute(
+                    "SELECT name FROM categories WHERE name = ?", (value,)
+                ).fetchone()
+                if saved_category is not None:
+                    value = str(saved_category["name"])
+            result = db.execute(
+                f"UPDATE products SET {field} = ? WHERE id = ?", (value, product_id)
+            )
+            if result.rowcount != 1:
+                raise StoreError("No se encontró ese producto.")
+
+    def add_variant(
+        self, product_id: int, size: str, color: str, price_minor: int, stock: int
+    ) -> int:
+        size = _required_value(size, "talle")
+        color = _required_value(color, "color")
+        if price_minor < 0 or stock < 0:
+            raise StoreError("El precio y el stock no pueden ser negativos.")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM products WHERE id = ? AND active = 1", (product_id,)
+            ).fetchone() is None:
+                raise StoreError("No se encontró un producto activo con ese ID.")
+            duplicate = db.execute(
+                """SELECT 1 FROM variants
+                   WHERE product_id = ? AND lower(size) = lower(?) AND lower(color) = lower(?)""",
+                (product_id, size, color),
+            ).fetchone()
+            if duplicate is not None:
+                raise StoreError("Ya existe una variante con ese talle y color.")
+            variant_count = db.execute(
+                "SELECT COUNT(*) FROM variants WHERE product_id = ?", (product_id,)
+            ).fetchone()[0]
+            sku = f"PRD-{product_id:06d}-{variant_count + 1:03d}"
+            cursor = db.execute(
+                """INSERT INTO variants
+                   (product_id, sku, size, color, price_minor, stock)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (product_id, sku, size, color, price_minor, stock),
+            )
+            if cursor.lastrowid is None:
+                raise StoreError("No se pudo agregar la variante.")
+            return cursor.lastrowid
+
+    def update_variant_field(self, variant_id: int, field: str, value: int) -> None:
+        if field not in {"price_minor", "stock"}:
+            raise ValueError(f"Unsupported variant field: {field}")
+        if value < 0:
+            raise StoreError("El valor no puede ser negativo.")
+        query = (
+            "UPDATE variants SET price_minor = ? WHERE id = ?"
+            if field == "price_minor"
+            else "UPDATE variants SET stock = ? WHERE id = ? AND ? >= reserved"
+        )
+        parameters = (value, variant_id) if field == "price_minor" else (
+            value, variant_id, value
+        )
+        with self._connect() as db:
+            result = db.execute(query, parameters)
+            if result.rowcount != 1:
+                raise StoreError("No se encontró la variante o el stock es menor al reservado.")
+
+    def deactivate_product(self, product_id: int) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            result = db.execute(
+                "UPDATE products SET active = 0 WHERE id = ? AND active = 1",
+                (product_id,),
+            )
+            if result.rowcount != 1:
+                raise StoreError("No se encontró un producto activo con ese ID.")
+            db.execute(
+                """DELETE FROM cart_items
+                   WHERE variant_id IN (SELECT id FROM variants WHERE product_id = ?)""",
+                (product_id,),
+            )
+
+    def activate_product(self, product_id: int) -> None:
+        with self._connect() as db:
+            result = db.execute(
+                "UPDATE products SET active = 1 WHERE id = ? AND active = 0",
+                (product_id,),
+            )
+            if result.rowcount != 1:
+                raise StoreError("No se encontró un producto inactivo con ese ID.")
+
+    def add_to_cart(self, telegram_id: int, variant_id: int, quantity: int = 1) -> None:
+        if quantity < 1:
+            raise StoreError("La cantidad debe ser mayor que cero.")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            variant = db.execute(
+                """SELECT v.stock, v.reserved,
+                          COALESCE(c.quantity, 0) AS cart_quantity
+                   FROM variants v
+                   JOIN products p ON p.id = v.product_id AND p.active = 1
+                   LEFT JOIN cart_items c ON c.variant_id = v.id AND c.telegram_id = ?
+                   WHERE v.id = ?""",
+                (telegram_id, variant_id),
+            ).fetchone()
+            if variant is None:
+                raise StoreError("Esa variante ya no está disponible.")
+            if variant["stock"] - variant["reserved"] < variant["cart_quantity"] + quantity:
+                raise StoreError("No hay suficiente stock disponible para esa cantidad.")
+            db.execute(
+                """INSERT INTO cart_items(telegram_id, variant_id, quantity)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(telegram_id, variant_id)
+                   DO UPDATE SET quantity = quantity + excluded.quantity""",
+                (telegram_id, variant_id, quantity),
+            )
+
+    def cart_items(self, telegram_id: int) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT c.variant_id, c.quantity, p.name AS product_name, v.sku,
+                          v.size, v.color, v.price_minor,
+                          v.price_minor * c.quantity AS subtotal_minor,
+                          v.stock - v.reserved AS available
+                   FROM cart_items c
+                   JOIN variants v ON v.id = c.variant_id
+                   JOIN products p ON p.id = v.product_id
+                   WHERE c.telegram_id = ?
+                   ORDER BY p.name, v.size, v.color""",
+                (telegram_id,),
+            ).fetchall()
+
+    def clear_cart(self, telegram_id: int) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM cart_items WHERE telegram_id = ?", (telegram_id,))
+
+    def set_cart_quantity(self, telegram_id: int, variant_id: int, quantity: int) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if quantity <= 0:
+                db.execute(
+                    "DELETE FROM cart_items WHERE telegram_id = ? AND variant_id = ?",
+                    (telegram_id, variant_id),
+                )
+                return
+            variant = db.execute(
+                """SELECT v.stock - v.reserved AS available FROM variants v
+                   JOIN cart_items c ON c.variant_id = v.id
+                   WHERE c.telegram_id = ? AND v.id = ?""",
+                (telegram_id, variant_id),
+            ).fetchone()
+            if variant is None:
+                raise StoreError("Ese producto ya no está en el carrito.")
+            if quantity > variant["available"]:
+                raise StoreError("La cantidad supera el stock disponible.")
+            db.execute(
+                "UPDATE cart_items SET quantity = ? WHERE telegram_id = ? AND variant_id = ?",
+                (quantity, telegram_id, variant_id),
+            )
+
+    def create_order(
+        self,
+        telegram_id: int,
+        customer_name: str,
+        contact: str,
+        delivery: str,
+        currency: str,
+        reservation_hours: int = 24,
+    ) -> int:
+        if reservation_hours < 1:
+            raise ValueError("reservation_hours must be at least 1")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            items = db.execute(
+                """SELECT c.quantity, v.id AS variant_id, v.sku, v.size, v.color,
+                          v.price_minor, v.stock, v.reserved, p.name AS product_name
+                   FROM cart_items c
+                   JOIN variants v ON v.id = c.variant_id
+                   JOIN products p ON p.id = v.product_id AND p.active = 1
+                   WHERE c.telegram_id = ?""",
+                (telegram_id,),
+            ).fetchall()
+            if not items:
+                raise StoreError("El carrito está vacío.")
+            for item in items:
+                if item["stock"] - item["reserved"] < item["quantity"]:
+                    raise StoreError(
+                        f"Stock insuficiente para {item['product_name']} "
+                        f"({item['color']}, talle {item['size']})."
+                    )
+            total = sum(item["price_minor"] * item["quantity"] for item in items)
+            order_id = db.execute(
+                """INSERT INTO orders
+                   (telegram_id, customer_name, contact, delivery, currency,
+                    total_minor, status, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', datetime('now', ?))""",
+                (
+                    telegram_id,
+                    customer_name,
+                    contact,
+                    delivery,
+                    currency,
+                    total,
+                    f"+{reservation_hours} hours",
+                ),
+            ).lastrowid
+            for item in items:
+                db.execute(
+                    "UPDATE variants SET reserved = reserved + ? WHERE id = ?",
+                    (item["quantity"], item["variant_id"]),
+                )
+                db.execute(
+                    """INSERT INTO order_items
+                       (order_id, variant_id, product_name, sku, size, color,
+                        quantity, unit_price_minor, subtotal_minor)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        order_id,
+                        item["variant_id"],
+                        item["product_name"],
+                        item["sku"],
+                        item["size"],
+                        item["color"],
+                        item["quantity"],
+                        item["price_minor"],
+                        item["price_minor"] * item["quantity"],
+                    ),
+                )
+            db.execute(
+                """INSERT INTO order_events
+                   (order_id, previous_status, new_status, actor_telegram_id)
+                   VALUES (?, NULL, 'pending', ?)""",
+                (order_id, telegram_id),
+            )
+            db.execute("DELETE FROM cart_items WHERE telegram_id = ?", (telegram_id,))
+            return int(order_id)
+
+    def get_order(self, order_id: int) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+
+    def order_items(self, order_id: int) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM order_items WHERE order_id = ? ORDER BY id", (order_id,)
+            ).fetchall()
+
+    def order_events(self, order_id: int) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT previous_status, new_status, reason, created_at
+                   FROM order_events WHERE order_id = ? ORDER BY id""",
+                (order_id,),
+            ).fetchall()
+
+    def resolve_order(
+        self,
+        order_id: int,
+        new_status: str,
+        actor_telegram_id: int,
+        reason: str = "",
+    ) -> str:
+        if new_status not in {"confirmed", "rejected"}:
+            raise ValueError("new_status must be confirmed or rejected")
+        current_order = self.get_order(order_id)
+        if current_order is not None and current_order["status"] != "pending":
+            return str(current_order["status"])
+        return self.update_order_status(order_id, new_status, actor_telegram_id, reason)
+
+    def update_order_status(
+        self,
+        order_id: int,
+        new_status: str,
+        actor_telegram_id: int,
+        reason: str = "",
+    ) -> str:
+        transitions = {
+            "pending": {"confirmed", "rejected", "cancelled"},
+            "confirmed": {"preparing", "cancelled"},
+            "preparing": {"shipped", "ready_for_pickup", "cancelled"},
+            "shipped": {"delivered"},
+            "ready_for_pickup": {"delivered"},
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            order = db.execute(
+                "SELECT status FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if order is None:
+                raise StoreError("No se encontró ese pedido.")
+            previous_status = str(order["status"])
+            if previous_status == new_status:
+                return previous_status
+            if new_status not in transitions.get(previous_status, set()):
+                raise StoreError(
+                    f"No se puede cambiar un pedido de {previous_status} a {new_status}."
+                )
+            items = db.execute(
+                "SELECT variant_id, quantity FROM order_items WHERE order_id = ?",
+                (order_id,),
+            ).fetchall()
+            for item in items:
+                if new_status == "confirmed":
+                    updated = db.execute(
+                        """UPDATE variants SET stock = stock - ?, reserved = reserved - ?
+                           WHERE id = ? AND stock >= ? AND reserved >= ?""",
+                        (
+                            item["quantity"], item["quantity"], item["variant_id"],
+                            item["quantity"], item["quantity"],
+                        ),
+                    )
+                elif previous_status == "pending":
+                    updated = db.execute(
+                        """UPDATE variants SET reserved = reserved - ?
+                           WHERE id = ? AND reserved >= ?""",
+                        (item["quantity"], item["variant_id"], item["quantity"]),
+                    )
+                elif new_status == "cancelled":
+                    updated = db.execute(
+                        "UPDATE variants SET stock = stock + ? WHERE id = ?",
+                        (item["quantity"], item["variant_id"]),
+                    )
+                else:
+                    continue
+                if updated.rowcount != 1:
+                    raise StoreError("No se pudo actualizar el inventario; revise el stock.")
+            db.execute(
+                "UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id)
+            )
+            db.execute(
+                """INSERT INTO order_events
+                   (order_id, previous_status, new_status, actor_telegram_id, reason)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (order_id, previous_status, new_status, actor_telegram_id, reason),
+            )
+            return new_status
+
+    def expire_pending_orders(self, reservation_hours: int = 24) -> list[sqlite3.Row]:
+        if reservation_hours < 1:
+            raise ValueError("reservation_hours must be at least 1")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE orders
+                   SET expires_at = datetime(created_at, ?)
+                   WHERE status = 'pending' AND expires_at IS NULL""",
+                (f"+{reservation_hours} hours",),
+            )
+            expired = db.execute(
+                """SELECT id, telegram_id FROM orders
+                   WHERE status = 'pending' AND expires_at <= CURRENT_TIMESTAMP
+                   ORDER BY id"""
+            ).fetchall()
+            for order in expired:
+                items = db.execute(
+                    "SELECT variant_id, quantity FROM order_items WHERE order_id = ?",
+                    (order["id"],),
+                ).fetchall()
+                for item in items:
+                    updated = db.execute(
+                        """UPDATE variants SET reserved = reserved - ?
+                           WHERE id = ? AND reserved >= ?""",
+                        (item["quantity"], item["variant_id"], item["quantity"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise StoreError(
+                            "No se pudo liberar la reserva vencida; revise el inventario."
+                        )
+                db.execute(
+                    "UPDATE orders SET status = 'cancelled' WHERE id = ?",
+                    (order["id"],),
+                )
+                db.execute(
+                    """INSERT INTO order_events
+                       (order_id, previous_status, new_status, actor_telegram_id, reason)
+                       VALUES (?, 'pending', 'cancelled', 0, ?)""",
+                    (order["id"], "Reserva vencida automáticamente."),
+                )
+            return expired
+
+    def pending_orders(self) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT id, telegram_id, customer_name, total_minor, currency, created_at
+                   FROM orders WHERE status = 'pending'
+                   ORDER BY created_at, id"""
+            ).fetchall()
+
+    def customer_order(self, order_id: int, telegram_id: int) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT * FROM orders
+                   WHERE id = ? AND telegram_id = ?""",
+                (order_id, telegram_id),
+            ).fetchone()
+
+    def customer_orders(self, telegram_id: int) -> list[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                """SELECT id, status, total_minor, currency, created_at
+                   FROM orders WHERE telegram_id = ? ORDER BY id DESC LIMIT 10""",
+                (telegram_id,),
+            ).fetchall()
+
+
+def _required_text(source: dict[str, Any], key: str) -> str:
+    value = source.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Missing or invalid {key!r} in catalog")
+    return value.strip()
+
+
+def _required_value(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise StoreError(f"El {label} no puede estar vacío.")
+    return value.strip()

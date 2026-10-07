@@ -1,0 +1,25 @@
+{
+  "products": [
+    {
+      "name": "Remera básica",
+      "description": "Remera de algodón, corte clásico.",
+      "category": "Remeras",
+      "photo_url": "",
+      "variants": [
+        {"sku": "REM-NEG-M", "size": "M", "color": "Negro", "price_minor": 450000, "stock": 5},
+        {"sku": "REM-BLA-M", "size": "M", "color": "Blanco", "price_minor": 450000, "stock": 3},
+        {"sku": "REM-NEG-L", "size": "L", "color": "Negro", "price_minor": 450000, "stock": 4}
+      ]
+    },
+    {
+      "name": "Buzo urbano",
+      "description": "Buzo frisado con capucha.",
+      "category": "Buzos",
+      "photo_url": "",
+      "variants": [
+        {"sku": "BUZ-GRI-M", "size": "M", "color": "Gris", "price_minor": 1290000, "stock": 2},
+        {"sku": "BUZ-GRI-L", "size": "L", "color": "Gris", "price_minor": 1290000, "stock": 2}
+      ]
+    }
+  ]
+}
