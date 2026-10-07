@@ -1,0 +1,28 @@
+services:
+  - type: worker
+    name: bot-management-store
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_SELLER_ID
+        sync: false
+      - key: DATABASE_PATH
+        value: /var/data/store.sqlite3
+      - key: PERSISTENCE_PATH
+        value: /var/data/bot_state.pickle
+      - key: CATALOG_PATH
+        value: catalog.json
+      - key: CURRENCY
+        value: ARS
+      - key: SHOP_NAME
+        value: Tienda
+      - key: ORDER_RESERVATION_HOURS
+        value: "24"

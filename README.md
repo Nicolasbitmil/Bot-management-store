@@ -255,6 +255,28 @@ No compartir ni subir el archivo `.env`. Luego iniciar el bot:
 python bot.py
 ```
 
+### Despliegue en Render
+
+El archivo `render.yaml` configura el bot como un **Background Worker** con
+polling y un disco persistente para SQLite y el estado de Telegram. Para
+desplegarlo:
+
+1. Subir el repositorio a GitHub y, en Render, elegir **New +** → **Blueprint**.
+2. Conectar el repositorio y confirmar la creación del servicio definido en
+   `render.yaml`.
+3. En la configuración inicial, completar `TELEGRAM_BOT_TOKEN` (token de
+   BotFather) y `TELEGRAM_SELLER_ID` (ID numérico del vendedor).
+4. Antes del primer despliegue, reemplazar `catalog.json` por el catálogo real.
+   El catálogo se importa a SQLite cuando la base de datos está vacía; después,
+   los productos se administran desde Telegram con `/admin`.
+5. Revisar `SHOP_NAME` y `CURRENCY` en las variables de entorno del servicio.
+
+El servicio necesita un plan pago de worker para adjuntar el disco persistente.
+No quites el disco ni cambies las rutas `DATABASE_PATH` y `PERSISTENCE_PATH`:
+SQLite y el estado de conversación se perderían entre reinicios. Mantené una
+sola instancia del worker, ya que el bot usa polling y el disco no debe
+compartirse entre instancias.
+
 El administrador autorizado debe abrir el bot en Telegram y enviar `/admin`.
 Desde el panel, primero puede crear las categorías en **Categorías**. Luego
 puede elegir una al crear cada producto o asignarla desde la ficha de un
